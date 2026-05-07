@@ -114,10 +114,12 @@ def assemble_prompt_node(state: AgentState) -> AgentState:
     tests_dir = Path(state["tests_dir"])
 
     sections: list[str] = [
-        "You are a JUnit 5 test generation expert.",
-        "The following Java classes have incomplete test coverage.",
-        "For each class, generate JUnit 5 tests that cover ALL missing methods, lines, and branches listed.",
-        "Return only valid Java source code — no markdown fences, no explanation.\n",
+        # Template included once — contains all JUnit 4 generation rules and instructions
+        template,
+        "=" * 60,
+        "# Coverage Gap Report — Classes Requiring Additional Tests",
+        "For each class below, generate JUnit 4 tests that cover ONLY the missed methods listed.",
+        "PRESERVE all existing @Test methods exactly as-is. Do NOT modify or remove them.",
         "=" * 60,
         state["gap_report"],
         "=" * 60 + "\n",
@@ -136,16 +138,11 @@ def assemble_prompt_node(state: AgentState) -> AgentState:
             f"Missed branches : {gap['missed_branches']}"
         )
 
-        filled = (
-            template
-            .replace("{{class_name}}", cls)
-            .replace("{{source_code}}", source_code)
-            .replace("{{coverage_gaps}}", per_class_gap)
-            .replace("{{existing_tests}}", existing_tests)
-        )
-
         sections.append(f"=== CLASS: {cls} ===")
-        sections.append(filled)
+        sections.append(f"## Coverage Gaps\n{per_class_gap}")
+        sections.append(f"## Source Code\n```java\n{source_code}\n```")
+        if existing_tests:
+            sections.append(f"## Existing Tests (PRESERVE — do NOT modify or remove)\n```java\n{existing_tests}\n```")
         sections.append(f"=== END CLASS: {cls} ===\n")
 
     Path(state["output_prompt_path"]).write_text("\n".join(sections))
