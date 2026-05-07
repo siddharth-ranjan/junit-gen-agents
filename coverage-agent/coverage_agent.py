@@ -21,10 +21,18 @@ from langgraph.graph import END, StateGraph
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
-class ClassGap(TypedDict):
-    missed_methods: list[str]
+class MethodGap(TypedDict):
+    name: str
+    start_line: int       # 1-based line number from Jacoco XML
     missed_lines: int
     missed_branches: int
+    source: str           # extracted method body from .java file
+
+
+class ClassGap(TypedDict):
+    missed_method_gaps: list[MethodGap]
+    total_missed_lines: int
+    total_missed_branches: int
 
 
 class AgentState(TypedDict):
@@ -33,48 +41,119 @@ class AgentState(TypedDict):
     tests_dir: str
     template_path: str
     output_prompt_path: str
-    gaps: dict[str, ClassGap]
+    gaps: dict[str, ClassGap]   # class name → gap detail
     gap_report: str
     prompt_written: bool
+
+
+# ── Helper: extract method source from .java file ────────────────────────────
+
+def extract_method_source(source_lines: list[str], start_line: int) -> str:
+    """Extract a method body starting at start_line (1-based) by matching braces."""
+    idx = start_line - 1  # convert to 0-based
+    result = []
+    depth = 0
+    started = False
+
+    for i in range(idx, len(source_lines)):
+        line = source_lines[i]
+        result.append(line)
+        for ch in line:
+            if ch == '{':
+                depth += 1
+                started = True
+            elif ch == '}':
+                depth -= 1
+        if started and depth == 0:
+            break
+
+    return "\n".join(result)
 
 
 # ── Node 1: Parse Jacoco XML ──────────────────────────────────────────────────
 
 def parse_jacoco_node(state: AgentState) -> AgentState:
-    """Parse jacoco.xml and extract classes with missed coverage."""
+    """Parse jacoco.xml and extract classes with missed coverage, including per-method source."""
     tree = ET.parse(state["jacoco_xml_path"])
     root = tree.getroot()
+    source_dir = Path(state["source_dir"])
     gaps: dict[str, ClassGap] = {}
 
     for package in root.findall("package"):
+        pkg_name = package.get("name", "")
+
+        # Build method gaps from <class> elements
+        class_method_gaps: dict[str, list[MethodGap]] = {}
+        for cls_el in package.findall("class"):
+            sourcefilename = cls_el.get("sourcefilename", "")
+            class_name = Path(sourcefilename).stem
+            if not class_name:
+                continue
+
+            # Load source lines once per class
+            candidates = [
+                source_dir / pkg_name / sourcefilename,
+                source_dir / sourcefilename,
+                *source_dir.rglob(sourcefilename),
+            ]
+            source_lines: list[str] = []
+            for c in candidates:
+                p = c if isinstance(c, Path) else c
+                if p.exists():
+                    source_lines = p.read_text().splitlines()
+                    break
+
+            for method in cls_el.findall("method"):
+                method_missed = 0
+                method_missed_lines = 0
+                method_missed_branches = 0
+                for counter in method.findall("counter"):
+                    t, missed = counter.get("type"), int(counter.get("missed", 0))
+                    if t == "METHOD":
+                        method_missed = missed
+                    elif t == "LINE":
+                        method_missed_lines = missed
+                    elif t == "BRANCH":
+                        method_missed_branches = missed
+
+                if method_missed > 0:
+                    start_line = int(method.get("line", 0))
+                    method_source = (
+                        extract_method_source(source_lines, start_line)
+                        if source_lines and start_line > 0
+                        else "// source not available"
+                    )
+                    class_method_gaps.setdefault(class_name, []).append({
+                        "name": method.get("name", "<unknown>"),
+                        "start_line": start_line,
+                        "missed_lines": method_missed_lines,
+                        "missed_branches": method_missed_branches,
+                        "source": method_source,
+                    })
+
+        # Build file-level totals from <sourcefile> elements
         for sourcefile in package.findall("sourcefile"):
             class_name = Path(sourcefile.get("name", "")).stem
-
-            missed_methods: list[str] = []
-            for method in sourcefile.findall("method"):
-                for counter in method.findall("counter"):
-                    if counter.get("type") == "METHOD" and int(counter.get("missed", 0)) > 0:
-                        missed_methods.append(method.get("name", "<unknown>"))
-
-            missed_lines, missed_branches = 0, 0
+            total_missed_lines, total_missed_branches = 0, 0
             for counter in sourcefile.findall("counter"):
                 t, missed = counter.get("type"), int(counter.get("missed", 0))
                 if t == "LINE":
-                    missed_lines = missed
+                    total_missed_lines = missed
                 elif t == "BRANCH":
-                    missed_branches = missed
+                    total_missed_branches = missed
 
-            if missed_methods or missed_lines > 0 or missed_branches > 0:
+            missed_method_gaps = class_method_gaps.get(class_name, [])
+            if missed_method_gaps or total_missed_lines > 0 or total_missed_branches > 0:
                 gaps[class_name] = {
-                    "missed_methods": missed_methods,
-                    "missed_lines": missed_lines,
-                    "missed_branches": missed_branches,
+                    "missed_method_gaps": missed_method_gaps,
+                    "total_missed_lines": total_missed_lines,
+                    "total_missed_branches": total_missed_branches,
                 }
 
     print(f"📊 Parsed {state['jacoco_xml_path']}: {len(gaps)} class(es) with coverage gaps")
     for cls, gap in gaps.items():
-        print(f"   {cls}: {len(gap['missed_methods'])} missed method(s), "
-              f"{gap['missed_lines']} missed line(s), {gap['missed_branches']} missed branch(es)")
+        print(f"   {cls}: {len(gap['missed_method_gaps'])} missed method(s), "
+              f"{gap['total_missed_lines']} missed line(s), {gap['total_missed_branches']} missed branch(es)")
 
     return {**state, "gaps": gaps}
 
@@ -91,13 +170,11 @@ def build_gap_report_node(state: AgentState) -> AgentState:
 
     lines = ["# Coverage Gap Report\n"]
     for cls, gap in gaps.items():
+        method_names = [m["name"] for m in gap["missed_method_gaps"]]
         lines.append(f"## {cls}")
-        lines.append(f"- Missed lines    : {gap['missed_lines']}")
-        lines.append(f"- Missed branches : {gap['missed_branches']}")
-        if gap["missed_methods"]:
-            lines.append("- Missed methods  :")
-            for m in gap["missed_methods"]:
-                lines.append(f"    - `{m}`")
+        lines.append(f"- Missed methods  : {', '.join(method_names) or 'none'}")
+        lines.append(f"- Missed lines    : {gap['total_missed_lines']}")
+        lines.append(f"- Missed branches : {gap['total_missed_branches']}")
         lines.append("")
 
     report = "\n".join(lines)
@@ -108,42 +185,59 @@ def build_gap_report_node(state: AgentState) -> AgentState:
 # ── Node 3: Assemble prompt and write to disk ─────────────────────────────────
 
 def assemble_prompt_node(state: AgentState) -> AgentState:
-    """Fill the JUnit template with gap report + source code and write prompt file."""
+    """Assemble the final prompt matching the draft structure and write to disk."""
     template = Path(state["template_path"]).read_text()
     source_dir = Path(state["source_dir"])
     tests_dir = Path(state["tests_dir"])
 
     sections: list[str] = [
-        # Template included once — contains all JUnit 4 generation rules and instructions
         template,
         "=" * 60,
         "# Coverage Gap Report — Classes Requiring Additional Tests",
-        "For each class below, generate JUnit 4 tests that cover ONLY the missed methods listed.",
-        "PRESERVE all existing @Test methods exactly as-is. Do NOT modify or remove them.",
-        "=" * 60,
-        state["gap_report"],
+        "",
+        "⚠️  STRICT RULES:",
+        "  1. Generate @Test methods ONLY for the MISSED METHODS listed per class.",
+        "  2. Do NOT modify, remove, or re-implement any method that is NOT in the missed list.",
+        "  3. Do NOT duplicate any existing @Test method.",
+        "  4. Preserve all existing @Test methods exactly as-is.",
         "=" * 60 + "\n",
     ]
 
     for cls, gap in state["gaps"].items():
-        source_file = source_dir / f"{cls}.java"
-        source_code = source_file.read_text() if source_file.exists() else f"// {cls}.java not found"
+        method_names = [m["name"] for m in gap["missed_method_gaps"]]
 
-        test_file = tests_dir / f"{cls}Test.java"
-        existing_tests = test_file.read_text() if test_file.exists() else ""
+        # Resolve source file (package-relative or flat)
+        pkg_candidates = list(source_dir.rglob(f"{cls}.java"))
+        source_code = pkg_candidates[0].read_text() if pkg_candidates else f"// {cls}.java not found"
 
-        per_class_gap = (
-            f"Missed methods  : {', '.join(gap['missed_methods']) or 'none'}\n"
-            f"Missed lines    : {gap['missed_lines']}\n"
-            f"Missed branches : {gap['missed_branches']}"
-        )
+        test_candidates = list(tests_dir.rglob(f"{cls}Test.java"))
+        existing_tests = test_candidates[0].read_text() if test_candidates else ""
 
         sections.append(f"=== CLASS: {cls} ===")
-        sections.append(f"## Coverage Gaps\n{per_class_gap}")
-        sections.append(f"## Source Code\n```java\n{source_code}\n```")
+        sections.append(f"File: {cls}.java")
+        sections.append("")
+        sections.append(f"Missed Methods   : {', '.join(method_names) or 'none'}")
+        sections.append(f"Missed Line Count: {gap['total_missed_lines']}")
+        sections.append(f"Missed Branch Count: {gap['total_missed_branches']}")
+        sections.append("")
+
+        # Per-method detail
+        sections.append("### Methods (missed — write tests for these):")
+        for mg in gap["missed_method_gaps"]:
+            sections.append(f"\n#### `{mg['name']}` (line {mg['start_line']}, "
+                            f"missed lines: {mg['missed_lines']}, missed branches: {mg['missed_branches']})")
+            sections.append(f"```java\n{mg['source']}\n```")
+
+        sections.append("")
+        sections.append("### Full Source Code:")
+        sections.append(f"```java\n{source_code}\n```")
+
         if existing_tests:
-            sections.append(f"## Existing Tests (PRESERVE — do NOT modify or remove)\n```java\n{existing_tests}\n```")
-        sections.append(f"=== END CLASS: {cls} ===\n")
+            sections.append("")
+            sections.append("### Existing Tests — DO NOT MODIFY OR REMOVE ANY OF THESE:")
+            sections.append(f"```java\n{existing_tests}\n```")
+
+        sections.append(f"\n=== END CLASS: {cls} ===\n")
 
     Path(state["output_prompt_path"]).write_text("\n".join(sections))
     print(f"✅ Prompt written to: {state['output_prompt_path']}")
@@ -157,6 +251,9 @@ def final_report_node(state: AgentState) -> AgentState:
     print("FINAL REPORT")
     print("=" * 60)
     print(f"  Classes with gaps : {len(state['gaps'])}")
+    for cls, gap in state["gaps"].items():
+        print(f"   {cls}: {len(gap['missed_method_gaps'])} missed method(s), "
+              f"{gap['total_missed_lines']} missed line(s), {gap['total_missed_branches']} missed branch(es)")
     if state.get("prompt_written"):
         print(f"  Prompt written to : {state['output_prompt_path']}")
     else:
